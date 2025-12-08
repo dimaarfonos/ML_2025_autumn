@@ -1,7 +1,7 @@
 import numpy as np
 import scipy
+import scipy.sparse
 from scipy.special import expit
-
 
 class BaseSmoothOracle(object):
     """
@@ -18,13 +18,13 @@ class BaseSmoothOracle(object):
         Computes the gradient at point x.
         """
         raise NotImplementedError('Grad oracle is not implemented.')
-    
+
     def hess(self, x):
         """
         Computes the Hessian matrix at point x.
         """
         raise NotImplementedError('Hessian oracle is not implemented.')
-    
+
     def func_directional(self, x, d, alpha):
         """
         Computes phi(alpha) = f(x + alpha*d).
@@ -57,13 +57,13 @@ class QuadraticOracle(BaseSmoothOracle):
         return self.A.dot(x) - self.b
 
     def hess(self, x):
-        return self.A 
+        return self.A
 
 
 class LogRegL2Oracle(BaseSmoothOracle):
     """
     Oracle for logistic regression with l2 regularization:
-         func(x) = 1/m sum_i log(1 + exp(-b_i * a_i^T x)) + regcoef / 2 ||x||_2^2.
+       func(x) = 1/m sum_i log(1 + exp(-b_i * a_i^T x)) + regcoef / 2 ||x||_2^2.
 
     Let A and b be parameters of the logistic regression (feature matrix
     and labels vector respectively).
@@ -71,12 +71,12 @@ class LogRegL2Oracle(BaseSmoothOracle):
 
     Parameters
     ----------
-        matvec_Ax : function
-            Computes matrix-vector product Ax, where x is a vector of size n.
-        matvec_ATx : function of x
-            Computes matrix-vector product A^Tx, where x is a vector of size m.
-        matmat_ATsA : function
-            Computes matrix-matrix-matrix product A^T * Diag(s) * A,
+    matvec_Ax : function
+        Computes matrix-vector product Ax, where x is a vector of size n.
+    matvec_ATx : function of x
+        Computes matrix-vector product A^Tx, where x is a vector of size m.
+    matmat_ATsA : function
+        Computes matrix-matrix-matrix product A^T * Diag(s) * A,
     """
     def __init__(self, matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef):
         self.matvec_Ax = matvec_Ax
@@ -86,149 +86,221 @@ class LogRegL2Oracle(BaseSmoothOracle):
         self.regcoef = regcoef
 
     def func(self, x):
-        #  func(x) = 1/m sum_i log(1 + exp(-b_i * a_i^T x)) + regcoef / 2 ||x||_2^2.
+        # f(x) = 1/m * sum(log(1 + exp(-b_i * <a_i, x>))) + regcoef/2 * ||x||^2
+        Ax = self.matvec_Ax(x)
+        margins = -self.b * Ax
         
-        Ax = self.matvec_Ax(x) # A@x
-        z = -self.b * Ax #z_i = -b_i * a_i^T x
-        loss = np.mean(np.logaddexp(0, z)) #1/m * sum(log(1 + exp(z_i)))
-        reg = 0.5 * self.regcoef * np.dot(x, x) # regcoef/2 * ||x||^2
+        # Use logaddexp for numerical stability
+        logistic_loss = np.mean(np.logaddexp(0, margins))
+        l2_reg = 0.5 * self.regcoef * np.dot(x, x)
         
-        return loss + reg 
+        return logistic_loss + l2_reg
 
     def grad(self, x):
-        Ax = self.matvec_Ax(x) # A@x
-        z = -self.b * Ax #z_i = -b_i * a_i^T x
-        s = expit(z) #s_i = 1/(1 + exp(-z_i))
-        v = -self.b *s #v_i = -b_i * s_i
-        grad = self.matvec_ATx(v) / len(self.b) + self.regcoef * x # 1/m * A^T @ v + regcoef * x
+        # grad = -1/m * A^T @ (b * sigmoid(-b * Ax)) + lambda * x
+        Ax = self.matvec_Ax(x)
+        margins = -self.b * Ax
+        sigmoid_vals = expit(margins)
         
-        return grad
+        m = self.b.shape[0]
+        # gradient of loss part
+        grad_loss = - (1.0 / m) * self.matvec_ATx(self.b * sigmoid_vals)
+        # gradient of regularization part
+        grad_reg = self.regcoef * x
+        
+        return grad_loss + grad_reg
 
     def hess(self, x):
-        Ax = self.matvec_Ax(x) # A@x
-        z = -self.b * Ax #z_i = -b_i * a_i^T x
-        s = expit(z) * (1 - expit(z))
-        H = self.matmat_ATsA(s) / len(self.b) # 1/m * A^T * Diag(s * (1 - s)) * A
+        # hess = 1/m * A^T @ diag(s) @ A + regcoef * I
+        # where s = sigmoid(-bAx) * (1 - sigmoid(-bAx))
+        Ax = self.matvec_Ax(x)
+        margins = -self.b * Ax
+        p = expit(margins)
+        s = p * (1 - p)
         
-        return H + self.regcoef * np.eye(len(x)) # + regcoef * I
+        m = self.b.shape[0]
+        hess_loss = (1.0 / m) * self.matmat_ATsA(s)
+        
+        # Handle sparse vs dense logic for I
+        if scipy.sparse.issparse(hess_loss):
+            hess_reg = scipy.sparse.eye(x.shape[0], format='csr') * self.regcoef
+            res = hess_loss + hess_reg
+            # *** FIX: Convert to dense for np.allclose compatibility in tests ***
+            return res.toarray()
+        else:
+            hess_reg = np.eye(x.shape[0]) * self.regcoef
+            return hess_loss + hess_reg
 
 
 class LogRegL2OptimizedOracle(LogRegL2Oracle):
     """
-    Oracle for logistic regression with l2 regularization
-    with optimized *_directional methods (are used in line_search).
-
-    For explanation see LogRegL2Oracle.
+    Oracle with caching for optimal performance.
     """
     def __init__(self, matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef):
         super().__init__(matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef)
+        
+        self._x_current = None
+        self._Ax_current = None
+        
+        self._d_current = None
+        self._Ad_current = None
+        
+        self._x_last_dir = None
+        self._Ax_last_dir = None
+
+    def _update_x(self, x):
+        if self._x_current is not None and np.array_equal(x, self._x_current):
+            return
+        if self._x_last_dir is not None and np.array_equal(x, self._x_last_dir):
+            self._x_current = self._x_last_dir
+            self._Ax_current = self._Ax_last_dir
+            return
+        self._x_current = np.copy(x)
+        self._Ax_current = self.matvec_Ax(x)
+
+    def _update_d(self, d):
+        if self._d_current is not None and np.array_equal(d, self._d_current):
+            return
+        self._d_current = np.copy(d)
+        self._Ad_current = self.matvec_Ax(d)
+
+    def func(self, x):
+        self._update_x(x)
+        margins = -self.b * self._Ax_current
+        logistic_loss = np.mean(np.logaddexp(0, margins))
+        l2_reg = 0.5 * self.regcoef * np.dot(x, x)
+        return logistic_loss + l2_reg
+
+    def grad(self, x):
+        self._update_x(x)
+        margins = -self.b * self._Ax_current
+        sigmoid_vals = expit(margins)
+        m = self.b.shape[0]
+        grad_loss = - (1.0 / m) * self.matvec_ATx(self.b * sigmoid_vals)
+        grad_reg = self.regcoef * x
+        return grad_loss + grad_reg
+
+    def hess(self, x):
+        self._update_x(x)
+        margins = -self.b * self._Ax_current
+        p = expit(margins)
+        s = p * (1 - p)
+        
+        m = self.b.shape[0]
+        hess_loss = (1.0 / m) * self.matmat_ATsA(s)
+        
+        if scipy.sparse.issparse(hess_loss):
+            hess_reg = scipy.sparse.eye(x.shape[0], format='csr') * self.regcoef
+            res = hess_loss + hess_reg
+            # *** FIX: Convert to dense here as well ***
+            return res.toarray()
+        else:
+            hess_reg = np.eye(x.shape[0]) * self.regcoef
+            return hess_loss + hess_reg
 
     def func_directional(self, x, d, alpha):
-        # TODO: Implement optimized version with pre-computation of Ax and Ad
-        return None
+        self._update_x(x)
+        self._update_d(d)
+        
+        Ax_alpha_d = self._Ax_current + alpha * self._Ad_current
+        x_alpha_d = x + alpha * d
+        
+        self._x_last_dir = x_alpha_d
+        self._Ax_last_dir = Ax_alpha_d
+        
+        margins = -self.b * Ax_alpha_d
+        logistic_loss = np.mean(np.logaddexp(0, margins))
+        l2_reg = 0.5 * self.regcoef * np.dot(x_alpha_d, x_alpha_d)
+        return logistic_loss + l2_reg
 
     def grad_directional(self, x, d, alpha):
-        # TODO: Implement optimized version with pre-computation of Ax and Ad
-        return None
+        self._update_x(x)
+        self._update_d(d)
+        
+        Ax_alpha_d = self._Ax_current + alpha * self._Ad_current
+        x_alpha_d = x + alpha * d
+        
+        self._x_last_dir = x_alpha_d
+        self._Ax_last_dir = Ax_alpha_d
+        
+        margins = -self.b * Ax_alpha_d
+        sigmoid_vals = expit(margins)
+        m = self.b.shape[0]
+        
+        grad_loss_dot_d = - (1.0 / m) * np.dot(self.b * sigmoid_vals, self._Ad_current)
+        grad_reg_dot_d = self.regcoef * np.dot(x_alpha_d, d)
+        
+        return grad_loss_dot_d + grad_reg_dot_d
 
 
 def create_log_reg_oracle(A, b, regcoef, oracle_type='usual'):
     """
     Auxiliary function for creating logistic regression oracles.
-        `oracle_type` must be either 'usual' or 'optimized'
     """
-
     if scipy.sparse.issparse(A):
-        # Для разреженных матриц
         matvec_Ax = lambda x: A.dot(x)
         matvec_ATx = lambda x: A.T.dot(x)
-        
         def matmat_ATsA(s):
-            # A^T @ diag(s) @ A для разреженной матрицы
             return A.T.dot(scipy.sparse.diags(s).dot(A))
     else:
-        # Для плотных матриц
-        matvec_Ax = lambda x: A @ x
-        matvec_ATx = lambda x: A.T @ x
-        
+        matvec_Ax = lambda x: A.dot(x)
+        matvec_ATx = lambda x: A.T.dot(x)
         def matmat_ATsA(s):
-           
-            return A.T @ np.diag(s) @ A
-        
-    # def matvec_Ax(x):
-    #     return A.dot(x)
-
-    # def matvec_ATx(x):
-    #     return A.T.dot(x)
-
-    # def matmat_ATsA(s):
-    #     # Вычисляет A^T * diag(s) * A
-    #     s =  np.asarray(s).reshape(-1, 1)  # Преобразуем s в столбец вектор
-    #     if scipy.sparse.issparse(A):
-    #         As = A.multiply(s)  # Элементное умножение каждой строки A на соответствующий s_i
-    #     else:
-    #         As = A * s  # Элементное умножение каждой строки A на соответствующий s_i
-    #     return A.T.dot(As)
+            return (A.T * s).dot(A)
 
     if oracle_type == 'usual':
         oracle = LogRegL2Oracle
     elif oracle_type == 'optimized':
         oracle = LogRegL2OptimizedOracle
     else:
-        raise 'Unknown oracle_type=%s' % oracle_type
-    return oracle(matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef)
+        raise ValueError('Unknown oracle_type=%s' % oracle_type)
 
+    return oracle(matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef)
 
 
 def grad_finite_diff(func, x, eps=1e-8):
     """
-    Returns approximation of the gradient using finite differences:
-        result_i := (f(x + eps * e_i) - f(x)) / eps,
-        where e_i are coordinate vectors:
-        e_i = (0, 0, ..., 0, 1, 0, ..., 0)
-                          >> i <<
+    Computes numerical gradient using finite differences.
     """
-    x = np.asarray(x, dtype=float) # преобразуем вход x в numpy-вектор
-    grad = np.zeros_like(x)  # vector to store resulting gradient
-    f0 = func(x)  # м значение функции в точке x
+    n = len(x)
+    grad = np.zeros(n)
+    f_x = func(x)
     
-    for i in range(len(x)):
-        x_shifted = x.copy()
-        x_shifted[i]+= eps
-        f1 = func(x_shifted)
-        grad[i] = (f1 - f0) / eps
-
+    for i in range(n):
+        e_i = np.zeros(n)
+        e_i[i] = eps
+        f_x_plus = func(x + e_i)
+        grad[i] = (f_x_plus - f_x) / eps
+        
     return grad
 
 
 def hess_finite_diff(func, x, eps=1e-5):
     """
-    Returns approximation of the Hessian using finite differences:
-        result_{ij} := (f(x + eps * e_i + eps * e_j)
-                               - f(x + eps * e_i) 
-                               - f(x + eps * e_j)
-                               + f(x)) / eps^2,
-        where e_i are coordinate vectors:
-        e_i = (0, 0, ..., 0, 1, 0, ..., 0)
-                          >> i <<
+    Computes numerical Hessian using finite differences.
     """
-    x = np.asarray(x, dtype=float)
-    n = x.shape[0]
-    H = np.zeros((n,n), dtype=float)
-    f0 = func(x)
+    n = len(x)
+    hess = np.zeros((n, n))
+    f_x = func(x)
+    
+    # Precompute f(x + e_i) to reduce oracle calls
+    f_x_plus_i = np.zeros(n)
     for i in range(n):
-        ei = np.zeros_like(x)
-        ei[i] = eps
-        f_i = func(x + ei)
+        e_i = np.zeros(n)
+        e_i[i] = eps
+        f_x_plus_i[i] = func(x + e_i)
+        
+    for i in range(n):
+        e_i = np.zeros(n)
+        e_i[i] = eps
         for j in range(i, n):
-            ej = np.zeros_like(x)
-            ej[j] = eps
-            if i == j:
-                f_ij = func(x + 2*ei)
-                H[i,j] = (f_ij - 2*f_i + f0) / (eps**2)
-            else:
-                    f_ij = func(x + ei + ej)
-                    f_j = func(x + ej)
-                    H[i, j] = (f_ij - f_i - f_j + f0) / (eps ** 2)
-                    H[j, i] = H[i, j] 
-    return H
+            e_j = np.zeros(n)
+            e_j[j] = eps
+            
+            f_x_plus_ij = func(x + e_i + e_j)
+            
+            val = (f_x_plus_ij - f_x_plus_i[i] - f_x_plus_i[j] + f_x) / (eps ** 2)
+            hess[i, j] = val
+            hess[j, i] = val
+            
+    return hess
