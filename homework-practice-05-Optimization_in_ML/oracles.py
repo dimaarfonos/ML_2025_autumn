@@ -125,7 +125,7 @@ class LogRegL2Oracle(BaseSmoothOracle):
         if scipy.sparse.issparse(hess_loss):
             hess_reg = scipy.sparse.eye(x.shape[0], format='csr') * self.regcoef
             res = hess_loss + hess_reg
-            # *** FIX: Convert to dense for np.allclose compatibility in tests ***
+            # *** 
             return res.toarray()
         else:
             hess_reg = np.eye(x.shape[0]) * self.regcoef
@@ -283,7 +283,7 @@ def hess_finite_diff(func, x, eps=1e-5):
     hess = np.zeros((n, n))
     f_x = func(x)
     
-    # Precompute f(x + e_i) to reduce oracle calls
+    # 
     f_x_plus_i = np.zeros(n)
     for i in range(n):
         e_i = np.zeros(n)
